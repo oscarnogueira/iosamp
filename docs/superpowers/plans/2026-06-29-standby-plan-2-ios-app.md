@@ -304,6 +304,15 @@ final class AppleSignIn: NSObject, ObservableObject,
 
 > `Keychain.write/read` must use a **shared access group** (Keychain Sharing capability) so the control intent's `BackendClient` can read `sessionToken`. Implement `Keychain.swift` with `kSecAttrAccessGroup` set to the shared group.
 
+> **Shared helper — define here (used by Task 5 too).** Both auth flows' `presentationAnchor` call `activeWindow()`. Put it in a shared app-target file (e.g. `UIKit+Helpers.swift`); needs `import UIKit`:
+> ```swift
+> import UIKit
+> @MainActor func activeWindow() -> ASPresentationAnchor {
+>     (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+>         .flatMap { $0.windows }.first { $0.isKeyWindow }) ?? ASPresentationAnchor()
+> }
+> ```
+
 - [ ] **Step 2: Manual run — tap Sign in with Apple on device, confirm `sessionToken` lands in Keychain (log it).**
 - [ ] **Step 3: Commit** `git commit -am "feat(ios): sign in with apple"`.
 
@@ -362,16 +371,7 @@ final class SpotifyOAuth: NSObject, ASWebAuthenticationPresentationContextProvid
 }
 ```
 
-Register the URL scheme `standbynp` in the app target's Info (URL Types).
-
-Shared helper for both auth flows — return the active scene's key window, not a detached `ASPresentationAnchor()` (a detached window can fail to present the sheet):
-
-```swift
-@MainActor func activeWindow() -> ASPresentationAnchor {
-    (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        .flatMap { $0.windows }.first { $0.isKeyWindow }) ?? ASPresentationAnchor()
-}
-```
+Register the URL scheme `standbynp` in the app target's Info (URL Types). `presentationAnchor` reuses the shared `activeWindow()` helper defined in Task 4.
 
 - [ ] **Step 2: Manual run — tap Connect Spotify, log in, confirm backend stores the token (`/health` or a debug endpoint shows a token row).**
 - [ ] **Step 3: Commit** `git commit -am "feat(ios): spotify oauth pkce"`.
