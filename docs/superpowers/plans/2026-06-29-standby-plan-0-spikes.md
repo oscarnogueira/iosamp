@@ -264,15 +264,18 @@ import "dotenv/config";                   // load .env (KEY_ID/TEAM_ID/P8_PATH/B
 import { send } from "./apnsClient.js";
 
 const token = process.argv[2];           // activity push token
-const n = Number(process.argv[3] ?? "1");
+const count = Number(process.argv[3] ?? "1");   // burst count — loop IN ONE process so the
+                                                // cached JWT is reused (avoids 403 TooManyProviderTokenUpdates)
 const topic = `${process.env.BUNDLE_ID}.push-type.liveactivity`;
-send(token, "liveactivity", topic, {
-  aps: {
-    timestamp: Math.floor(Date.now() / 1000),
-    event: "update",
-    "content-state": { title: `Pushed Track ${n}`, subtitle: "via APNs" },
-  },
-}, "10");
+for (let n = 1; n <= count; n++) {
+  await send(token, "liveactivity", topic, {
+    aps: {
+      timestamp: Math.floor(Date.now() / 1000),
+      event: "update",
+      "content-state": { title: `Pushed Track ${n}`, subtitle: "via APNs" },
+    },
+  }, "10");
+}
 ```
 
 - [ ] **Step 4: Run and measure latency on the AOD device**
@@ -284,7 +287,7 @@ cp .env.example .env   # fill KEY_ID, TEAM_ID, BUNDLE_ID, P8_PATH
 npx tsx src/sendLiveActivity.ts <TOKEN> 1
 ```
 
-With the phone in StandBy, time from running the command to the StandBy view changing. Repeat ~10 times back-to-back to probe the frequent-update budget (watch for updates that stop landing).
+With the phone in StandBy, time from running the command to the StandBy view changing. Then run a burst in ONE process (`npx tsx src/sendLiveActivity.ts <TOKEN> 10`) to probe the frequent-update budget — single process reuses the cached JWT, so a `403 TooManyProviderTokenUpdates` (provider-token throttle) is distinguishable from real budget throttling (200 + no render).
 
 Success: updates land within a few seconds on the AOD device; budget does not throttle on-change-rate pushes.
 

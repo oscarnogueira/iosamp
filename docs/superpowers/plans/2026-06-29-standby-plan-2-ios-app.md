@@ -31,11 +31,11 @@ StandByNP/
       SpotifyOAuth.swift             # PKCE flow via ASWebAuthenticationSession
       PKCE.swift                     # code_verifier/challenge (CryptoKit)
     Net/
-      BackendClient.swift            # typed API client (session JWT)
-      Keychain.swift                 # session token storage
+      BackendClient.swift            # typed API client (session JWT)  [membership: app + widget]
+      Keychain.swift                 # session token storage (shared access group)  [membership: app + widget]
     Activity/
-      ActivityController.swift       # start/observe-token/end + register with backend
-      ArtCache.swift                 # App Group art download + path resolution
+      ActivityController.swift       # start/observe-token/end + register with backend  [app only]
+      ArtCache.swift                 # App Group art download + path resolution  [membership: app + widget]
     UI/
       RootView.swift                 # sign-in + connect-spotify + start-standby
   StandByNPWidget/                   # widget extension target
@@ -51,8 +51,7 @@ StandByNP/
 
 **Files:**
 - Create: Xcode project `StandByNP` + Widget Extension `StandByNPWidget`
-- Create: `StandByNP/Models/NowPlayingAttributes.swift`
-- Create: `StandByNP/Models/NowPlaying.swift`
+- Create: `StandByNP/Models/NowPlayingAttributes.swift`  (holds both `NowPlayingAttributes` and its `ContentState` — no separate model file)
 
 - [ ] **Step 1: Create the project + widget target**
 
@@ -66,8 +65,14 @@ App Info.plist keys (REQUIRED — the "Include Live Activity" template adds neit
 - `NSSupportsLiveActivities = YES` — without it `Activity.request` does not work at all.
 - `NSSupportsLiveActivitiesFrequentUpdates = YES` — per spec, eases the update budget.
 - URL Types → add scheme `standbynp` (for the Spotify OAuth redirect).
+- `BACKEND_URL` (String, e.g. `$(BACKEND_URL)` from a build setting) — read by `AppState.init`.
+- `SPOTIFY_CLIENT_ID` (String) — read by `AppState.init` for the OAuth authorize URL.
 
 Shared config: store the backend base URL and the session token where BOTH the app and the widget-originated control intent can read them — use the App Group's shared `UserDefaults(suiteName: "group.com.you.standby")` for the base URL and a Keychain shared access group for the session token.
+
+**Target membership (compile gate):** `Net/BackendClient.swift`, `Net/Keychain.swift`, and `Activity/ArtCache.swift` must be added to BOTH the app and widget targets — the widget's `Controls.send` uses `BackendClient`+`Keychain`, and the Live Activity view uses `ArtCache`. They are Foundation/Security/UIKit-only (no app-only deps), so this is safe. `ActivityController.swift` and `AppState.swift` are app-target ONLY.
+
+Build settings → Info.plist (bridged via `$(VAR)`): add **`BACKEND_URL`** (e.g. `https://standby-nowplaying.fly.dev`) and **`SPOTIFY_CLIENT_ID`** to the app target's Info.plist — `AppState.init` reads both via `forInfoDictionaryKey`. Without them the app crashes on first launch.
 
 - [ ] **Step 2: Define the shared attributes (Target Membership: app + widget)**
 
@@ -221,7 +226,9 @@ final class BackendClient {
         if authed, let tok = sessionToken { req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization") }
         let (data, resp) = try await session.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if code == 204 || data.isEmpty { return nil }
+        // Backend returns 200 + literal `null` when nothing is playing — treat as nil,
+        // else decoding "null" into a non-optional struct throws.
+        if code == 204 || data.isEmpty || String(decoding: data, as: UTF8.self) == "null" { return nil }
         guard code == 200 else { throw BackendError.status }
         return try JSONDecoder().decode(T.self, from: data)
     }
@@ -291,7 +298,7 @@ final class AppleSignIn: NSObject, ObservableObject,
     func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
         print("APPLE_SIGNIN_FAILED: \(error)")
     }
-    func presentationAnchor(for _: ASAuthorizationController) -> ASPresentationAnchor { ASPresentationAnchor() }
+    func presentationAnchor(for _: ASAuthorizationController) -> ASPresentationAnchor { activeWindow() }
 }
 ```
 
@@ -351,11 +358,20 @@ final class SpotifyOAuth: NSObject, ASWebAuthenticationPresentationContextProvid
             s.start()
         }
     }
-    func presentationAnchor(for _: ASWebAuthenticationSession) -> ASPresentationAnchor { ASPresentationAnchor() }
+    func presentationAnchor(for _: ASWebAuthenticationSession) -> ASPresentationAnchor { activeWindow() }
 }
 ```
 
 Register the URL scheme `standbynp` in the app target's Info (URL Types).
+
+Shared helper for both auth flows — return the active scene's key window, not a detached `ASPresentationAnchor()` (a detached window can fail to present the sheet):
+
+```swift
+@MainActor func activeWindow() -> ASPresentationAnchor {
+    (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        .flatMap { $0.windows }.first { $0.isKeyWindow }) ?? ASPresentationAnchor()
+}
+```
 
 - [ ] **Step 2: Manual run — tap Connect Spotify, log in, confirm backend stores the token (`/health` or a debug endpoint shows a token row).**
 - [ ] **Step 3: Commit** `git commit -am "feat(ios): spotify oauth pkce"`.
@@ -380,9 +396,12 @@ final class ActivityController: ObservableObject {
     private var deviceId: String?
     init(backend: BackendClient) { self.backend = backend }
 
+    private var latestActivityToken: String?   // last seen; flushed once deviceId is known
+
     func registerDeviceToken(_ token: String) async throws {
         let out = try await backend.registerDevice(deviceToken: token)
         deviceId = out.id
+        if let t = latestActivityToken { try? await backend.registerActivity(deviceId: out.id, activityToken: t, pushToStart: nil) }
     }
 
     func start(initial: NowPlayingAttributes.ContentState, provider: String) throws {
@@ -397,7 +416,9 @@ final class ActivityController: ObservableObject {
         Task {
             for await tokenData in activity.pushTokenUpdates {
                 let hex = tokenData.map { String(format: "%02x", $0) }.joined()
+                latestActivityToken = hex
                 if let deviceId { try? await backend.registerActivity(deviceId: deviceId, activityToken: hex, pushToStart: nil) }
+                // if deviceId not yet known, registerDeviceToken() flushes latestActivityToken when it lands
             }
         }
         // push-to-start token (iOS 17.2+) — observe Activity.pushToStartTokenUpdates similarly.
@@ -605,7 +626,9 @@ struct NowPlayingLiveActivity: Widget {
                 Text("\(ctx.state.artist) — \(ctx.state.album)").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                 ProgressView(timerInterval: range(ctx.state), countsDown: false)
                     .labelsHidden()
-                ControlsRow()   // Task 9
+                ControlsRow()   // defined in Task 9; for Task 8's standalone build, stub it as
+                                // `struct ControlsRow: View { var body: some View { EmptyView() } }`
+                                // and replace with the real implementation in Task 9.
             }
         }.padding()
     }

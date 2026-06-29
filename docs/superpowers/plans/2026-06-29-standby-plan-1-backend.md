@@ -65,7 +65,7 @@ npx tsc --init --module nodenext --target es2022 --moduleResolution nodenext --o
 npm pkg set scripts.migrate="node --import tsx scripts/migrate.ts"   # prod migration runner
 ```
 
-> `scripts/migrate.ts` connects with `DATABASE_URL` and applies `migrations/*.sql` in order (idempotent). Run it on deploy (Fly release_command).
+> `scripts/migrate.ts` connects with `DATABASE_URL`, ensures a `schema_migrations(filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT now())` table, then applies each `migrations/*.sql` not already recorded, inside a transaction, and records it. This makes re-deploys safe even though `001_init.sql` uses plain `CREATE TABLE` (each file runs at most once). Run on deploy via the Fly `release_command`.
 
 `vitest.config.ts`:
 ```ts
@@ -340,6 +340,11 @@ export function issueRefresh(userId: string, secret: string): string {
 }
 export function verifySession(token: string, secret: string): { userId: string } {
   const p = jwt.verify(token, secret) as { sub: string };
+  return { userId: p.sub };
+}
+export function verifyRefresh(token: string, secret: string): { userId: string } {
+  const p = jwt.verify(token, secret) as { sub: string; typ?: string };
+  if (p.typ !== "refresh") throw new Error("not a refresh token");
   return { userId: p.sub };
 }
 ```
@@ -957,9 +962,11 @@ async function acquireLock(): Promise<boolean> {
   return true;   // never release this client while the poller runs
 }
 
-// Assemble collaborators once (vault, apns, artwork, spotify, refreshAccessToken).
-// import { LibsodiumVault } from "./vault/libsodium.js"; import { makeApns } from "./apns.js";
-// import * as artwork from "./artwork.js"; import { spotify, refreshAccessToken } from "./providers/spotify.js";
+// Assemble collaborators once.
+import { LibsodiumVault } from "./vault/libsodium.js";
+import { makeApns } from "./apns.js";
+import * as artwork from "./artwork.js";
+import { spotify, refreshAccessToken } from "./providers/spotify.js";
 const vault = new LibsodiumVault(cfg.encryptionKeyHex);
 const apns = makeApns(cfg.apns);
 
