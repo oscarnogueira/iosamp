@@ -24,8 +24,8 @@ StandByNP/
     StandByNPApp.swift               # @main, AppDelegate adaptor
     AppDelegate.swift                # remote-notif registration + silent wake handler
     Models/
-      NowPlayingAttributes.swift     # ActivityAttributes (shared: app + widget)
-      NowPlaying.swift               # ContentState payload model
+      NowPlayingAttributes.swift     # ActivityAttributes + ContentState (shared: app + widget)
+    AppState.swift                   # central app-side coordinator (Task 6.5)
     Auth/
       AppleSignIn.swift              # Sign in with Apple → session token
       SpotifyOAuth.swift             # PKCE flow via ASWebAuthenticationSession
@@ -56,7 +56,18 @@ StandByNP/
 
 - [ ] **Step 1: Create the project + widget target**
 
-Xcode → iOS App `StandByNP`, SwiftUI, min iOS 17.0. Add Widget Extension target `StandByNPWidget` with "Include Live Activity". Add capabilities to **both** targets: App Groups (`group.com.you.standby`). Add to the **app**: Sign in with Apple, Push Notifications, Background Modes → Remote notifications.
+Xcode → iOS App `StandByNP`, SwiftUI, min iOS 17.0. Add Widget Extension target `StandByNPWidget` with "Include Live Activity".
+
+Capabilities:
+- **Both** targets: App Groups (`group.com.you.standby`), Keychain Sharing (shared access group, so the session token written by the app is readable from the control-intent path).
+- **App** target: Sign in with Apple, Push Notifications, Background Modes → Remote notifications.
+
+App Info.plist keys (REQUIRED — the "Include Live Activity" template adds neither reliably):
+- `NSSupportsLiveActivities = YES` — without it `Activity.request` does not work at all.
+- `NSSupportsLiveActivitiesFrequentUpdates = YES` — per spec, eases the update budget.
+- URL Types → add scheme `standbynp` (for the Spotify OAuth redirect).
+
+Shared config: store the backend base URL and the session token where BOTH the app and the widget-originated control intent can read them — use the App Group's shared `UserDefaults(suiteName: "group.com.you.standby")` for the base URL and a Keychain shared access group for the session token.
 
 - [ ] **Step 2: Define the shared attributes (Target Membership: app + widget)**
 
@@ -164,9 +175,11 @@ func testAuthApplePostsIdTokenAndDecodesSession() async throws {
 }
 ```
 
+> Provide the test helper: `URLProtocolStub` (a `URLProtocol` subclass returning canned responses per path) and a `URLSession.stubbed` configured with `protocolClasses = [URLProtocolStub.self]`. Implement it in `StandByNPTests/Helpers/URLProtocolStub.swift`.
+
 - [ ] **Step 2: Run (FAIL).**
 
-- [ ] **Step 3: Implement Keychain (session token storage) + BackendClient**
+- [ ] **Step 3: Implement Keychain (shared access group) + BackendClient**
 
 ```swift
 // Net/BackendClient.swift
@@ -190,13 +203,28 @@ final class BackendClient {
         try await post("/device/register", body: ["deviceToken": deviceToken], authed: true)
     }
     func registerActivity(deviceId: String, activityToken: String, pushToStart: String?) async throws {
-        let _: EmptyOK = try await post("/activity/register",
-            body: ["deviceId": deviceId, "activityToken": activityToken,
-                   "pushToStartToken": pushToStart as Any], authed: true)
+        // NOTE: never put a bare Optional into the JSON dict — Optional.none boxed as Any
+        // crashes JSONSerialization. Use NSNull(), or omit the key.
+        var body: [String: Any] = ["deviceId": deviceId, "activityToken": activityToken]
+        body["pushToStartToken"] = pushToStart ?? NSNull()
+        let _: EmptyOK = try await post("/activity/register", body: body, authed: true)
     }
     func heartbeat(deviceId: String) async throws { let _: EmptyOK = try await post("/activity/heartbeat", body: ["deviceId": deviceId], authed: true) }
     func endActivity(deviceId: String) async throws { let _: EmptyOK = try await post("/activity/end", body: ["deviceId": deviceId], authed: true) }
     func control(_ action: String) async throws { let _: EmptyOK = try await post("/control", body: ["action": action], authed: true) }
+    func currentNowPlaying() async throws -> NowPlayingAttributes.ContentState? {
+        try await get("/nowplaying/current", authed: true)   // returns null body → nil
+    }
+
+    private func get<T: Decodable>(_ path: String, authed: Bool) async throws -> T? {
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        if authed, let tok = sessionToken { req.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization") }
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 204 || data.isEmpty { return nil }
+        guard code == 200 else { throw BackendError.status }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
 
     private func post<T: Decodable>(_ path: String, body: [String: Any], authed: Bool) async throws -> T {
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
@@ -231,14 +259,19 @@ enum BackendError: Error { case status }
 import AuthenticationServices
 
 @MainActor
-final class AppleSignIn: NSObject, ObservableObject, ASAuthorizationControllerDelegate {
+final class AppleSignIn: NSObject, ObservableObject,
+    ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
     private let backend: BackendClient
-    init(backend: BackendClient) { self.backend = backend }
+    private let onSignedIn: () -> Void
+    init(backend: BackendClient, onSignedIn: @escaping () -> Void) {
+        self.backend = backend; self.onSignedIn = onSignedIn
+    }
     func start() {
         let req = ASAuthorizationAppleIDProvider().createRequest()
         req.requestedScopes = [.fullName, .email]
         let c = ASAuthorizationController(authorizationRequests: [req])
         c.delegate = self
+        c.presentationContextProvider = self
         c.performRequests()
     }
     func authorizationController(controller: ASAuthorizationController,
@@ -247,13 +280,22 @@ final class AppleSignIn: NSObject, ObservableObject, ASAuthorizationControllerDe
               let idTokenData = cred.identityToken,
               let idToken = String(data: idTokenData, encoding: .utf8) else { return }
         Task {
-            let tokens = try await backend.authApple(idToken: idToken)
-            Keychain.write(tokens.sessionToken, for: "sessionToken")
-            Keychain.write(tokens.refreshToken, for: "refreshToken")
+            do {
+                let tokens = try await backend.authApple(idToken: idToken)
+                Keychain.write(tokens.sessionToken, for: "sessionToken")
+                Keychain.write(tokens.refreshToken, for: "refreshToken")
+                onSignedIn()        // flips AppState.signedIn so RootView advances
+            } catch { print("APPLE_SIGNIN_BACKEND_FAILED: \(error)") }
         }
     }
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+        print("APPLE_SIGNIN_FAILED: \(error)")
+    }
+    func presentationAnchor(for _: ASAuthorizationController) -> ASPresentationAnchor { ASPresentationAnchor() }
 }
 ```
+
+> `Keychain.write/read` must use a **shared access group** (Keychain Sharing capability) so the control intent's `BackendClient` can read `sessionToken`. Implement `Keychain.swift` with `kSecAttrAccessGroup` set to the shared group.
 
 - [ ] **Step 2: Manual run — tap Sign in with Apple on device, confirm `sessionToken` lands in Keychain (log it).**
 - [ ] **Step 3: Commit** `git commit -am "feat(ios): sign in with apple"`.
@@ -296,12 +338,16 @@ final class SpotifyOAuth: NSObject, ASWebAuthenticationPresentationContextProvid
         try await backend.connectSpotify(code: code, codeVerifier: pkce.verifier)
     }
 
+    private var authSession: ASWebAuthenticationSession?   // strong ref: else torn down mid-flow
+
     private func authenticate(url: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { cont in
             let s = ASWebAuthenticationSession(url: url, callbackURLScheme: redirectScheme) { cb, err in
                 if let cb { cont.resume(returning: cb) } else { cont.resume(throwing: err ?? BackendError.status) }
             }
             s.presentationContextProvider = self
+            s.prefersEphemeralWebBrowserSession = false
+            self.authSession = s        // hold for the flow's duration
             s.start()
         }
     }
@@ -357,15 +403,94 @@ final class ActivityController: ObservableObject {
         // push-to-start token (iOS 17.2+) — observe Activity.pushToStartTokenUpdates similarly.
     }
 
+    func heartbeatIfActive() async throws {
+        guard let deviceId, activity != nil else { return }
+        try await backend.heartbeat(deviceId: deviceId)
+    }
+
     func end() async {
         await activity?.end(nil, dismissalPolicy: .immediate)
         if let deviceId { try? await backend.endActivity(deviceId: deviceId) }
+        activity = nil
     }
 }
 ```
 
+> **Token-ordering note:** `deviceId` is set asynchronously by the APNs device-token callback (Task 7), while the activity push token can arrive first. Guard against the lost-registration race: `observeTokens()` should retry `registerActivity` once `deviceId` becomes available (e.g., store the latest activity token and (re)send it when either the device token or activity token lands).
+
 - [ ] **Step 2: Manual run — Start StandBy from the app; confirm `/activity/register` is hit (backend log shows activity token).**
 - [ ] **Step 3: Commit** `git commit -am "feat(ios): activity controller"`.
+
+---
+
+## Task 6.5: AppState coordinator (central, referenced by Tasks 7/9/10)
+
+**Files:**
+- Create: `StandByNP/AppState.swift`
+
+`AppState` is the single app-side coordinator that owns the collaborators and the UI flags. It is app-target only (NOT widget — see Task 9). It must exist before Task 7 wires the AppDelegate.
+
+- [ ] **Step 1: Implement**
+
+```swift
+// AppState.swift  (app target only)
+import SwiftUI
+import ActivityKit
+
+@MainActor
+final class AppState: ObservableObject {
+    static let shared = AppState()
+    let backend: BackendClient
+    let apple: AppleSignIn
+    let spotify: SpotifyOAuth
+    let activity: ActivityController
+
+    @Published var signedIn = false
+    @Published var spotifyConnected = false
+
+    private init() {
+        let base = URL(string: Bundle.main.object(forInfoDictionaryKey: "BACKEND_URL") as! String)!
+        // publish base URL into the App Group so the widget control intent can read it
+        UserDefaults(suiteName: "group.com.you.standby")?.set(base, forKey: "backendURL")
+        backend = BackendClient(baseURL: base)
+        apple = AppleSignIn(backend: backend) { [weak self] in self?.signedIn = true }
+        spotify = SpotifyOAuth(backend: backend,
+            clientId: Bundle.main.object(forInfoDictionaryKey: "SPOTIFY_CLIENT_ID") as! String)
+        activity = ActivityController(backend: backend)
+        signedIn = Keychain.read("sessionToken") != nil
+    }
+
+    func startStandby() async throws {
+        // Seed from the backend's current now-playing so session start shows real data + art.
+        let cur = try await backend.currentNowPlaying()       // GET /nowplaying/current (Plan 1)
+        if let cur, let art = cur.artUrl { await ArtCache.download(trackId: cur.trackId, from: art) }
+        try activity.start(initial: cur ?? .placeholder, provider: "spotify")
+        spotifyConnected = true
+    }
+
+    func heartbeatIfActive() async throws { try await activity.heartbeatIfActive() }
+
+    func refreshArtForCurrentActivity() async {
+        guard let act = Activity<NowPlayingAttributes>.activities.first else { return }
+        let s = act.content.state
+        if let art = s.artUrl { await ArtCache.download(trackId: s.trackId, from: art) }
+        // Re-render: push the SAME state so the widget re-reads the now-cached file.
+        await act.update(.init(state: s, staleDate: nil))
+    }
+}
+
+extension NowPlayingAttributes.ContentState {
+    static var placeholder: Self {
+        .init(trackId: "—", title: "Waiting…", artist: "", album: "",
+              artUrl: nil, durationMs: 0, progressMs: 0, isPlaying: false,
+              startedAt: 0, dominantColor: "#222222")
+    }
+}
+```
+
+> Resolves the "art at session start" guarantee: `startStandby()` seeds via the backend `GET /nowplaying/current` (added in Plan 1) and pre-downloads that track's art while the app is still foreground. Mid-session tracks rely on the silent-wake path (Task 7).
+
+- [ ] **Step 2: Commit** `git commit -am "feat(ios): AppState coordinator + seed-from-backend"`.
 
 ---
 
@@ -501,7 +626,18 @@ struct NowPlayingLiveActivity: Widget {
 }
 ```
 
-(Add a `Color(hex:)` initializer helper.)
+Add a `Color(hex:)` helper (widget target):
+
+```swift
+extension Color {
+    init(hex: String) {
+        let h = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        let v = UInt64(h, radix: 16) ?? 0x222222
+        self.init(.sRGB, red: Double((v >> 16) & 0xff) / 255,
+                  green: Double((v >> 8) & 0xff) / 255, blue: Double(v & 0xff) / 255)
+    }
+}
+```
 
 - [ ] **Step 3: Manual run on device — push a ContentState via backend; verify StandBy shows title/artist/badge/progress and art when cached, color background when not.**
 - [ ] **Step 4: Commit** `git commit -am "feat(ios): live activity standby view"`.
@@ -522,22 +658,30 @@ struct NowPlayingLiveActivity: Widget {
 // ControlIntents.swift  (Target Membership: app + widget)
 import AppIntents
 
-struct NextIntent: AppIntent {
+// MUST be LiveActivityIntent (not plain AppIntent) so a Button(intent:) inside the
+// Live Activity runs ON-DEVICE in the background (locked / StandBy) instead of
+// foregrounding the app. This is exactly the path Spike C validates.
+struct NextIntent: LiveActivityIntent {
     static var title: LocalizedStringResource = "Next"
     func perform() async throws -> some IntentResult { try await Controls.send("next"); return .result() }
 }
-struct PrevIntent: AppIntent {
+struct PrevIntent: LiveActivityIntent {
     static var title: LocalizedStringResource = "Previous"
     func perform() async throws -> some IntentResult { try await Controls.send("prev"); return .result() }
 }
-struct PlayPauseIntent: AppIntent {
+struct PlayPauseIntent: LiveActivityIntent {
     static var title: LocalizedStringResource = "Play/Pause"
     func perform() async throws -> some IntentResult { try await Controls.send("playpause"); return .result() }
 }
+
+// Controls must NOT reference AppState — this file compiles into the widget target,
+// where the app-side AppState (Apple sign-in, OAuth, ActivityKit) does not exist.
+// Build a minimal client from App-Group config + the shared-Keychain session token.
 enum Controls {
     static func send(_ action: String) async throws {
-        // BackendClient configured from shared App Group (baseURL + session token in Keychain).
-        try await AppState.shared.backend.control(action)
+        let base = UserDefaults(suiteName: "group.com.you.standby")?.url(forKey: "backendURL")
+        guard let base else { return }
+        try await BackendClient(baseURL: base).control(action)   // reads session token from shared Keychain
     }
 }
 ```
@@ -587,10 +731,18 @@ struct RootView: View {
 - [ ] **Step 2: Lifecycle-only heartbeat (NOT a timer)**
 
 ```swift
-// in StandByNPApp: on scenePhase change to .background/.active, ping heartbeat
-.onChange(of: scenePhase) { _, phase in
-    if phase == .background || phase == .active {
-        Task { try? await AppState.shared.heartbeatIfActive() }
+// StandByNPApp.swift
+@main
+struct StandByNPApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @Environment(\.scenePhase) private var scenePhase   // REQUIRED for onChange below
+    var body: some Scene {
+        WindowGroup { RootView() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background || phase == .active {
+                    Task { try? await AppState.shared.heartbeatIfActive() }
+                }
+            }
     }
 }
 ```

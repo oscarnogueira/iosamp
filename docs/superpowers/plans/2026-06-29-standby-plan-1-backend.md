@@ -38,7 +38,7 @@ backend/
     artwork.ts                      # fetch art, extract dominantColor hex
     apns.ts                         # JWT signing, liveactivity + silent push, 410 handling
     poller.ts                       # changed(), poll-one-user, active-set logic
-    routes.ts                       # Fastify route registration
+    routes.ts                       # Fastify route registration (incl. GET /nowplaying/current seed)
     server.ts                       # API process entrypoint
     poller-main.ts                  # poller process entrypoint (advisory lock)
   test/                             # mirrors src/
@@ -58,10 +58,14 @@ backend/
 ```bash
 mkdir -p backend/src backend/test && cd backend
 npm init -y
-npm i fastify pg libsodium-wrappers jsonwebtoken jose undici
-npm i -D typescript vitest @types/node @types/jsonwebtoken tsx
+npm pkg set type=module            # REQUIRED: nodenext ESM + .js specifiers + import.meta.url
+npm i fastify pg libsodium-wrappers jsonwebtoken jose undici sharp
+npm i -D typescript vitest @types/node @types/jsonwebtoken @types/pg tsx pg-mem
 npx tsc --init --module nodenext --target es2022 --moduleResolution nodenext --outDir dist
+npm pkg set scripts.migrate="node --import tsx scripts/migrate.ts"   # prod migration runner
 ```
+
+> `scripts/migrate.ts` connects with `DATABASE_URL` and applies `migrations/*.sql` in order (idempotent). Run it on deploy (Fly release_command).
 
 `vitest.config.ts`:
 ```ts
@@ -96,7 +100,7 @@ test("loads all required secrets", () => {
 // src/config.ts
 export interface Config {
   spotify: { clientId: string; redirectUri: string };
-  apns: { keyId: string; teamId: string; bundleId: string; p8: string };
+  apns: { keyId: string; teamId: string; bundleId: string; p8: string; host: string };
   apple: { clientId: string };
   encryptionKeyHex: string;
   sessionSecret: string;
@@ -109,7 +113,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   for (const k of REQUIRED) if (!env[k]) throw new Error(`Missing required secret: ${k}`);
   return {
     spotify: { clientId: env.SPOTIFY_CLIENT_ID!, redirectUri: env.SPOTIFY_REDIRECT_URI! },
-    apns: { keyId: env.APNS_KEY_ID!, teamId: env.APNS_TEAM_ID!, bundleId: env.APNS_BUNDLE_ID!, p8: env.APNS_P8! },
+    apns: { keyId: env.APNS_KEY_ID!, teamId: env.APNS_TEAM_ID!, bundleId: env.APNS_BUNDLE_ID!, p8: env.APNS_P8!,
+            host: env.APNS_HOST ?? "https://api.development.push.apple.com" },  // prod: api.push.apple.com
     apple: { clientId: env.APPLE_CLIENT_ID! },
     encryptionKeyHex: env.ENCRYPTION_KEY!,
     sessionSecret: env.SESSION_SECRET!,
@@ -602,13 +607,21 @@ async markPushResult(deviceId: string, status: number) {
   if (status >= 200 && status < 300) await pool.query(`UPDATE devices SET last_push_ok_at=now() WHERE id=$1`, [deviceId]);
 },
 async activeDevices() {
-  // zombie eviction: active AND polled recently OR never-pushed within grace window
+  // Zombie eviction. A device is polled while active AND either:
+  //  - it has had a successful push within 15min, OR
+  //  - it has NEVER been pushed yet but registered/heartbeat'd within a grace window.
+  // The NULL-last_push_ok_at case must be bounded by registration age, else a device
+  // that registered-then-force-quit-while-paused (no change → no push → no 410) lingers forever.
   const { rows } = await pool.query(
     `SELECT d.*, pt.ciphertext, pt.nonce, pt.needs_reauth
      FROM devices d
      JOIN provider_tokens pt ON pt.user_id = d.user_id AND pt.provider='spotify'
      WHERE d.active = true AND pt.needs_reauth = false
-       AND (d.last_push_ok_at IS NULL OR d.last_push_ok_at > now() - interval '15 minutes')`);
+       AND (
+         d.last_push_ok_at > now() - interval '15 minutes'
+         OR (d.last_push_ok_at IS NULL
+             AND COALESCE(d.last_heartbeat_at, d.updated_at) > now() - interval '15 minutes')
+       )`);
   return rows;
 },
 ```
@@ -659,9 +672,16 @@ export function buildHeaders(token: string, pushType: "liveactivity" | "backgrou
 }
 
 export function makeApns(cfg: { keyId: string; teamId: string; bundleId: string; p8: string; host: string }) {
+  // Cache the provider JWT: APNs rejects tokens minted too often (TooManyProviderTokenUpdates);
+  // reuse for ~50min.
+  let cached: { token: string; at: number } | null = null;
   function jwtToken() {
-    return jwt.sign({ iss: cfg.teamId, iat: Math.floor(Date.now() / 1000) }, cfg.p8,
-      { algorithm: "ES256", header: { alg: "ES256", kid: cfg.keyId } });
+    const now = Date.now();
+    if (!cached || now - cached.at > 50 * 60_000) {
+      cached = { token: jwt.sign({ iss: cfg.teamId, iat: Math.floor(now / 1000) }, cfg.p8,
+        { algorithm: "ES256", header: { alg: "ES256", kid: cfg.keyId } }), at: now };
+    }
+    return cached.token;
   }
   function send(token: string, pushType: "liveactivity" | "background",
     payload: object, priority: string): Promise<number> {
@@ -670,9 +690,16 @@ export function makeApns(cfg: { keyId: string; teamId: string; bundleId: string;
       const req = client.request({ ...buildHeaders(token, pushType, cfg.bundleId, priority),
         authorization: `bearer ${jwtToken()}` });
       let status = 0;
+      let body = "";
       req.on("response", (h) => (status = Number(h[":status"])));
+      // MUST consume the body: http2 streams stay paused until read, so 'end' never
+      // fires for error responses (incl. 410 {"reason":"Unregistered"}) and the Promise
+      // would hang — silently breaking the 410 liveness/eviction path.
+      req.setEncoding("utf8");
+      req.on("data", (c) => (body += c));
       req.on("end", () => { client.close(); resolve(status); });
-      req.on("error", reject);
+      req.on("error", (e) => { client.close(); reject(e); });
+      req.setTimeout(10_000, () => { req.close(); client.close(); reject(new Error("apns timeout")); });
       req.end(JSON.stringify(payload));
     });
   }
@@ -683,6 +710,12 @@ export function makeApns(cfg: { keyId: string; teamId: string; bundleId: string;
       }, "10"),
     pushSilentWake: (deviceToken: string) =>
       send(deviceToken, "background", { aps: { "content-available": 1 } }, "5"),
+    pushStopped: (activityToken: string) =>
+      send(activityToken, "liveactivity", {
+        aps: { timestamp: Math.floor(Date.now() / 1000), event: "update",
+          "content-state": { isPlaying: false, title: "Nothing playing", artist: "", album: "",
+            trackId: "", durationMs: 0, progressMs: 0, startedAt: 0 } },
+      }, "5"),
   };
 }
 ```
@@ -739,35 +772,42 @@ export function changed(prev: NowPlaying | null, cur: NowPlaying | null, elapsed
 // pollOneUser orchestrates: refresh token if needed → getNowPlaying → handle 401/429/revoked
 // → if changed: compute dominantColor, push liveactivity update + silent wake, markPushResult.
 // (Pure-ish: inject provider, apns, vault, db, artwork as params for testability.)
+// All collaborators injected via deps for testability — no dynamic import, no hidden cache.
+// deps.refreshAccessToken(clientId, refreshToken) → { access_token }.
 export async function pollOneUser(deps: {
   device: any; vault: any; db: any; spotify: any; apns: any; artwork: any;
+  refreshAccessToken: (clientId: string, refresh: string) => Promise<{ access_token: string }>;
   clientId: string; prev: NowPlaying | null; now: number;
 }): Promise<NowPlaying | null> {
-  const { device, vault, db, spotify, apns, artwork, clientId, prev, now } = deps;
+  const { device, vault, db, spotify, apns, artwork, refreshAccessToken, clientId, prev, now } = deps;
   const refresh = await vault.open(device.ciphertext, device.nonce);
   let access: string;
   try {
-    access = (await spotify.refreshAccessTokenCached?.(clientId, refresh)) // optional cache
-      ?? (await import("./providers/spotify.js")).refreshAccessToken(clientId, refresh).then((r: any) => r.access_token);
+    access = (await refreshAccessToken(clientId, refresh)).access_token;   // properly awaited
   } catch (e: any) {
     if (e.revoked) { await db.markNeedsReauth(device.user_id, "spotify"); return prev; }
-    throw e;
+    return prev;                            // transient refresh error: keep last
   }
   let cur: NowPlaying | null;
   try { cur = await spotify.getNowPlaying(access); }
   catch (e: any) {
-    if (e.expired) return prev;            // next tick refreshes
-    if (e.retryAfter) return prev;         // central backoff handled by loop
-    return prev;                            // 5xx/timeout: keep last
+    // 401 expired / 429 retryAfter / 5xx / timeout: keep last state, next tick recovers.
+    return prev;
   }
   const elapsed = prev ? now - prev.startedAt - prev.progressMs : 0;
   if (changed(prev, cur, Math.max(0, elapsed))) {
-    if (cur) cur.dominantColor = cur.artUrl ? await artwork.dominantColor(cur.artUrl) : undefined;
-    if (device.activity_token && cur) {
-      const status = await apns.pushUpdate(device.activity_token, toContentState(cur));
-      await db.markPushResult(device.id, status);
-      if (device.device_token) await apns.pushSilentWake(device.device_token);
+    if (!device.activity_token) return cur;
+    let status: number;
+    if (cur) {
+      cur.dominantColor = cur.artUrl ? await artwork.dominantColor(cur.artUrl) : undefined;
+      status = await apns.pushUpdate(device.activity_token, toContentState(cur));
+      if (device.device_token) await apns.pushSilentWake(device.device_token);  // wake to cache art
+    } else {
+      // 204 → playback stopped: push a "stopped" content-state so the Live Activity
+      // doesn't show the last track forever (spec §error table).
+      status = await apns.pushStopped(device.activity_token);
     }
+    await db.markPushResult(device.id, status);
   }
   return cur;
 }
@@ -811,24 +851,38 @@ test("authed routes reject missing session", async () => {
 - [ ] **Step 3: Implement routes** (auth guard via `preHandler` verifying session JWT; endpoints from spec)
 
 ```ts
-// src/routes.ts (sketch — wire real deps in server.ts)
+// src/routes.ts
 import type { FastifyInstance } from "fastify";
+
+// deps shape (assembled in server.ts):
+//   db, vault, apple:{verify}, session:{issue,issueRefresh,verify,verifyRefresh},
+//   spotify:{exchangeCode,getNowPlaying,control}, refreshAccessToken, clientId
 export function registerRoutes(app: FastifyInstance, deps: any) {
   const auth = async (req: any, reply: any) => {
     const h = req.headers.authorization?.replace("Bearer ", "");
     try { req.userId = deps.session.verify(h).userId; }
     catch { reply.code(401).send({ error: "unauthorized" }); }
   };
+  // Resolve a user's live Spotify access token (open vault → refresh). Shared by /control + /nowplaying/current.
+  async function userAccessToken(userId: string): Promise<string> {
+    const row = await deps.db.getProviderToken(userId, "spotify");
+    if (!row || row.needs_reauth) throw new Error("needs-reauth");
+    const refresh = await deps.vault.open(row.ciphertext, row.nonce);
+    return (await deps.refreshAccessToken(deps.clientId, refresh)).access_token;
+  }
+
   app.post("/auth/apple", async (req: any) => {
     const { sub } = await deps.apple.verify(req.body.idToken);
     const user = await deps.db.upsertUser(sub);
     return { sessionToken: deps.session.issue(user.id), refreshToken: deps.session.issueRefresh(user.id) };
   });
-  app.post("/auth/refresh", async (req: any) => deps.session.refresh(req.body.refreshToken));
+  app.post("/auth/refresh", async (req: any, reply: any) => {
+    try { return { sessionToken: deps.session.issue(deps.session.verifyRefresh(req.body.refreshToken).userId) }; }
+    catch { reply.code(401).send({ error: "bad refresh" }); }
+  });
   app.post("/spotify/connect", { preHandler: auth }, async (req: any) => {
     const tok = await deps.spotify.exchangeCode(req.body.code, req.body.codeVerifier);
-    const enc = await deps.vault.seal(tok.refresh_token);
-    await deps.db.saveProviderToken(req.userId, "spotify", enc);
+    await deps.db.saveProviderToken(req.userId, "spotify", await deps.vault.seal(tok.refresh_token));
     return { ok: true };
   });
   app.post("/device/register", { preHandler: auth }, async (req: any) =>
@@ -840,14 +894,17 @@ export function registerRoutes(app: FastifyInstance, deps: any) {
   app.post("/activity/heartbeat", { preHandler: auth }, async (req: any) => { await deps.db.heartbeat(req.body.deviceId); return { ok: true }; });
   app.post("/activity/end", { preHandler: auth }, async (req: any) => { await deps.db.endActivity(req.body.deviceId); return { ok: true }; });
   app.post("/control", { preHandler: auth }, async (req: any) => {
-    const refresh = await deps.getUserRefresh(req.userId);
-    const access = (await deps.spotify.refresh(refresh)).access_token;
-    await deps.spotify.control(access, req.body.action);
+    await deps.spotify.control(await userAccessToken(req.userId), req.body.action);
     return { ok: true };
   });
-  app.get("/health", async () => ({ ok: true, poller: deps.pollerStatus() }));
+  // Seed endpoint for the app at StandBy start (live fetch; returns null when nothing playing).
+  app.get("/nowplaying/current", { preHandler: auth }, async (req: any) =>
+    (await deps.spotify.getNowPlaying(await userAccessToken(req.userId))) ?? null);
+  app.get("/health", async () => ({ ok: true }));   // poller liveness is separate (DB heartbeat row)
 }
 ```
+
+> Add `verifyRefresh` to `session.ts` (same as `verifySession` but asserts `typ === "refresh"`).
 
 - [ ] **Step 4: Run (PASS).** — [ ] **Step 5: Commit** `git commit -am "feat(backend): http routes"`.
 
@@ -889,23 +946,37 @@ const pool = new Pool({ connectionString: cfg.databaseUrl });
 const db = makeDb(pool);
 const prevByDevice = new Map<string, any>();
 
+// Hold the advisory lock on a DEDICATED long-lived client. A session-scoped lock
+// taken via pool.query() is released when the pooled connection is reaped
+// (idleTimeoutMillis), letting a second poller acquire it. Keep one client checked out.
+let lockClient: import("pg").PoolClient | null = null;
 async function acquireLock(): Promise<boolean> {
-  const { rows } = await pool.query(`SELECT pg_try_advisory_lock(987654321) AS got`);
-  return rows[0].got;
+  lockClient = await pool.connect();
+  const { rows } = await lockClient.query(`SELECT pg_try_advisory_lock(987654321) AS got`);
+  if (!rows[0].got) { lockClient.release(); lockClient = null; return false; }
+  return true;   // never release this client while the poller runs
 }
+
+// Assemble collaborators once (vault, apns, artwork, spotify, refreshAccessToken).
+// import { LibsodiumVault } from "./vault/libsodium.js"; import { makeApns } from "./apns.js";
+// import * as artwork from "./artwork.js"; import { spotify, refreshAccessToken } from "./providers/spotify.js";
+const vault = new LibsodiumVault(cfg.encryptionKeyHex);
+const apns = makeApns(cfg.apns);
 
 async function tick() {
   const devices = await db.activeDevices();
   const now = Date.now();
   for (const device of devices) {
     try {
-      const cur = await pollOneUser({ device, db, /* vault, spotify, apns, artwork */ } as any,
-        /* prev */ prevByDevice.get(device.id), now, cfg.spotify.clientId as any);
+      const cur = await pollOneUser({
+        device, vault, db, spotify, apns, artwork,
+        refreshAccessToken, clientId: cfg.spotify.clientId,
+        prev: prevByDevice.get(device.id) ?? null, now,
+      });
       prevByDevice.set(device.id, cur);
-    } catch (e) { app_log(e); }
+    } catch (e) { console.error("poll error", device.id, e); }
   }
 }
-function app_log(e: unknown) { console.error(e); }
 
 (async () => {
   if (!(await acquireLock())) { console.log("another poller holds the lock; exiting"); process.exit(0); }
@@ -931,6 +1002,8 @@ function app_log(e: unknown) { console.error(e); }
 ```toml
 app = "standby-nowplaying"
 [build]
+[deploy]
+  release_command = "npm run migrate"    # apply migrations/*.sql before new version goes live
 [processes]
   api = "node dist/server.js"
   poller = "node dist/poller-main.js"
@@ -951,7 +1024,7 @@ app = "standby-nowplaying"
 ```bash
 fly secrets set SPOTIFY_CLIENT_ID=... SPOTIFY_REDIRECT_URI=standbynp://spotify-callback \
   APNS_KEY_ID=... APNS_TEAM_ID=... APNS_BUNDLE_ID=com.you.standby \
-  APNS_P8="$(cat AuthKey.p8)" ENCRYPTION_KEY=$(openssl rand -hex 32) \
+  APNS_P8="$(cat AuthKey.p8)" APNS_HOST=https://api.push.apple.com ENCRYPTION_KEY=$(openssl rand -hex 32) \
   APPLE_CLIENT_ID=com.you.standby SESSION_SECRET=$(openssl rand -hex 32) \
   DATABASE_URL=postgres://...
 fly scale count poller=1   # pin poller to exactly one instance

@@ -25,6 +25,14 @@
 
 Each spike ends in a **recorded verdict** (PASS / PARTIAL / FAIL + notes) written into this file. Spikes do not use TDD — they are manual on-device experiments with explicit success criteria.
 
+**Run order: A → C → B → D.** Task 1 (A) builds the rendering activity + widget that everything else needs. Then run **Spike C (Task 3) immediately**, before B/D — interactive buttons in StandBy is the spec's highest-risk assumption, so surface its "design changes to…" branch earliest. B and D follow. (Document task numbering is by build dependency; execution order is A, C, B, D.)
+
+**Prerequisite capabilities (add in Task 1, before any push spike):**
+- **Push Notifications** capability on the app target (`aps-environment` entitlement). Required for `Activity.request(pushType:.token)` to yield a usable token AND for APNs to accept any push — without it Spike B has no valid token.
+- **Background Modes → Remote notifications** (needed by Spike D).
+- App Info.plist: `NSSupportsLiveActivitiesFrequentUpdates = YES` (the "Include Live Activity" template adds `NSSupportsLiveActivities` but NOT this one). Without it, Spike B's burst is throttled under the default conservative budget and gives a misleading verdict on the exact question it exists to answer.
+- Confirm Live Activities are enabled for SpikeApp in Settings (`ActivityAuthorizationInfo().areActivitiesEnabled == true`).
+
 ---
 
 ## File Structure
@@ -108,12 +116,31 @@ struct ContentView: View {
         }.padding()
     }
     func start() {
+        // Confirm Live Activities are enabled, else a nil activity reads as a false Spike-A FAIL.
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+            print("LIVE_ACTIVITIES_DISABLED — enable for SpikeApp in Settings"); return
+        }
         let attr = SpikeAttributes(label: "spike")
         let state = SpikeAttributes.ContentState(title: "Track 0", subtitle: "Artist")
-        activity = try? Activity.request(
-            attributes: attr,
-            content: .init(state: state, staleDate: nil),
-            pushType: .token)   // .token so Spike B can push
+        do {
+            activity = try Activity.request(
+                attributes: attr,
+                content: .init(state: state, staleDate: nil),
+                pushType: .token)   // .token so Spike B can push
+            observeToken()          // start token observer on the non-nil activity
+        } catch {
+            print("ACTIVITY_REQUEST_FAILED: \(error)")   // don't swallow with try?
+        }
+    }
+
+    // Spike B uses this; defined here so it captures the just-created activity.
+    func observeToken() {
+        guard let activity else { return }
+        Task {
+            for await tokenData in activity.pushTokenUpdates {
+                print("ACTIVITY_PUSH_TOKEN=\(tokenData.map { String(format: "%02x", $0) }.joined())")
+            }
+        }
     }
     func update() async {
         n += 1
@@ -175,21 +202,9 @@ git commit -m "spike(A): live activity renders + updates in StandBy"
 - Create: `spike/spike-pusher/.env.example`
 - Modify: `spike/SpikeApp/SpikeApp/ContentView.swift` (print the activity push token)
 
-- [ ] **Step 1: Print the activity push token from the app**
+- [ ] **Step 1: Get the activity push token**
 
-Add to `ContentView.swift` after `start()`:
-
-```swift
-Task {
-    guard let activity else { return }
-    for await tokenData in activity.pushTokenUpdates {
-        let token = tokenData.map { String(format: "%02x", $0) }.joined()
-        print("ACTIVITY_PUSH_TOKEN=\(token)")
-    }
-}
-```
-
-Run, Start Activity, copy the token from the Xcode console.
+The `observeToken()` added to `start()` in Task 1 already prints `ACTIVITY_PUSH_TOKEN=...`. Run, tap Start Activity, copy the token from the Xcode console. (Requires the Push Notifications capability from the Task 1 prerequisites — without it no token is issued.)
 
 - [ ] **Step 2: Create the APNs client (HTTP/2 + JWT)**
 
@@ -209,14 +224,22 @@ export function makeJWT(): string {
   });
 }
 
-export function send(token: string, pushType: string, payload: object, priority = "10") {
+// Cache the provider JWT across the run — APNs expects token reuse (new at most
+// ~once/20min). A fresh JWT per request in a burst risks 403 TooManyProviderTokenUpdates,
+// which would be misread as Live Activity budget throttling in Spike B.
+let cachedJWT: string | null = null;
+function providerJWT() { return (cachedJWT ??= makeJWT()); }
+
+// topic must be passed explicitly: liveactivity → `${bundle}.push-type.liveactivity`,
+// background/content-available → plain bundle id.
+export function send(token: string, pushType: string, topic: string, payload: object, priority = "10") {
   // Use api.sandbox.push.apple.com for development builds.
   const client = http2.connect("https://api.sandbox.push.apple.com:443");
   const headers = {
     ":method": "POST",
     ":path": `/3/device/${token}`,
-    authorization: `bearer ${makeJWT()}`,
-    "apns-topic": `${process.env.BUNDLE_ID}.push-type.liveactivity`,
+    authorization: `bearer ${providerJWT()}`,
+    "apns-topic": topic,
     "apns-push-type": pushType,
     "apns-priority": priority,
   };
@@ -237,11 +260,13 @@ export function send(token: string, pushType: string, payload: object, priority 
 
 ```ts
 // spike/spike-pusher/src/sendLiveActivity.ts
+import "dotenv/config";                   // load .env (KEY_ID/TEAM_ID/P8_PATH/BUNDLE_ID)
 import { send } from "./apnsClient.js";
 
 const token = process.argv[2];           // activity push token
 const n = Number(process.argv[3] ?? "1");
-send(token, "liveactivity", {
+const topic = `${process.env.BUNDLE_ID}.push-type.liveactivity`;
+send(token, "liveactivity", topic, {
   aps: {
     timestamp: Math.floor(Date.now() / 1000),
     event: "update",
@@ -253,7 +278,10 @@ send(token, "liveactivity", {
 - [ ] **Step 4: Run and measure latency on the AOD device**
 
 ```bash
-cd spike/spike-pusher && npm i && npx tsx src/sendLiveActivity.ts <TOKEN> 1
+cd spike/spike-pusher
+npm i jsonwebtoken dotenv && npm i -D tsx @types/jsonwebtoken
+cp .env.example .env   # fill KEY_ID, TEAM_ID, BUNDLE_ID, P8_PATH
+npx tsx src/sendLiveActivity.ts <TOKEN> 1
 ```
 
 With the phone in StandBy, time from running the command to the StandBy view changing. Repeat ~10 times back-to-back to probe the frequent-update budget (watch for updates that stop landing).
@@ -363,9 +391,11 @@ Wire it: add `@UIApplicationDelegateAdaptor(AppDelegate.self) var delegate` to `
 
 ```ts
 // spike/spike-pusher/src/sendSilent.ts
+import "dotenv/config";
 import { send } from "./apnsClient.js";
 const deviceToken = process.argv[2];   // STANDARD device token, not activity token
-send(deviceToken, "background", { aps: { "content-available": 1 } }, "5");
+const topic = process.env.BUNDLE_ID!;  // plain bundle id for background/content-available
+send(deviceToken, "background", topic, { aps: { "content-available": 1 } }, "5");
 ```
 
 > Note: silent pushes use `apns-push-type: background`, priority 5, and the topic is the **plain bundle id** (no `.push-type.liveactivity` suffix). Adjust `apnsClient` topic for this call.
