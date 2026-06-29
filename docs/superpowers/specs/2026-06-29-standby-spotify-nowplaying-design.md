@@ -46,6 +46,17 @@ added later.
    remote images at render time.
 6. **Live Activity lifetime ~8h** (extendable). Re-start via push-to-start
    (iOS 17.2+) or reopening the app.
+7. **StandBy passive freshness is hardware-gated.** Only always-on-display
+   devices (iPhone 14 Pro / 15 Pro / 16 Pro class) keep StandBy rendering
+   continuously, so pushed updates appear passively within ~10s. On non-AOD
+   iPhones StandBy sleeps the screen after ~20s and re-renders only on
+   tap/motion — the update is delivered but not seen until the user glances.
+   The ~10s goal therefore applies to AOD devices; non-AOD is "fresh on glance."
+8. **Interactive buttons in StandBy are unverified.** `Button(intent:)` works on
+   the Lock Screen, but StandBy (dimmed/Night Mode) may treat the first touch as
+   "wake display" rather than activating the control. This is the spec's
+   riskiest assumption and MUST be proven on a physical device in an early spike
+   before the control feature is built out.
 
 ## Architecture
 
@@ -84,32 +95,57 @@ Three components:
 Sign in with Apple yields a stable `apple_sub` → maps to an internal `userId`.
 All per-user data (tokens, devices) is keyed by `userId`.
 
+### OAuth flow decision (resolves PKCE vs client_secret)
+We use **Authorization Code + PKCE as a public client** — **no `client_secret`
+anywhere**. The device generates `code_verifier`/`code_challenge`, opens the
+Spotify authorize URL, receives the `code` via redirect, then sends
+`{ code, code_verifier }` to the backend, which performs the token exchange
+(PKCE, no secret) and stores the resulting `refresh_token`. Rationale: the
+backend is the token vault, but PKCE removes the need to ship or hold a
+confidential secret for this flow.
+- **Redirect URI:** custom scheme registered to the app (e.g.
+  `standbynp://spotify-callback`); the app captures the code and forwards it.
+
 ### Two classes of secret
-- **App-level keys** (Spotify `client_secret`, APNs `.p8`, master encryption
-  key): live **only** in Fly Secrets, never in the app binary or git. PKCE is
-  used precisely so the device never needs `client_secret`.
+- **App-level keys** (APNs `.p8`, master encryption key, Spotify `client_id`):
+  live **only** in Fly Secrets, never in the app binary or git. No Spotify
+  `client_secret` exists (PKCE public client).
 - **Per-user tokens** (each user's Spotify `refresh_token`): created at the
   backend during OAuth, stored **encrypted at-rest** in Postgres, keyed by
   `userId`. The device does not retain the long-lived refresh token.
 
 ### Initial setup (once per user)
 ```
-App: Sign in with Apple → userId
-App: "Connect Spotify" → OAuth PKCE (browser) → user logs in at Spotify
+App: Sign in with Apple → backend verifies identity token → issues SESSION JWT
+App: "Connect Spotify" → generate code_verifier/code_challenge (PKCE)
+  → open Spotify authorize URL (browser) → user logs in at Spotify
   scopes: user-read-playback-state, user-read-currently-playing,
           user-modify-playback-state
-  → authorization code → backend
-  → backend exchanges for refresh_token
+  → redirect (standbynp://) returns authorization code to app
+  → app POSTs { code, code_verifier } to backend (with session JWT)
+  → backend exchanges (PKCE) for refresh_token
   → backend encrypts (TokenVault) and stores provider_tokens[userId][spotify]
 ```
+
+### App ↔ backend session model
+Sign in with Apple's identity token is verified **once** at `/auth/apple`; the
+backend then issues its own **session JWT** (short-lived access + longer-lived
+refresh) used as the bearer for all subsequent endpoints. Endpoints are NOT
+authenticated with the raw Apple token per request.
 
 ### Device registration (per StandBy session)
 ```
 App starts Live Activity → ActivityKit yields activity push token
-  → app POSTs token to backend → stored in devices[userId]
+  → app POSTs token to backend → stored in devices[deviceId]
+App OBSERVES activity.pushTokenUpdates stream → on rotation, re-POSTs new token
+  (ActivityKit can rotate the per-activity token mid-session; pushing to a
+   stale token silently fails).
 Optional (iOS 17.2+): push-to-start token → backend can re-start Activity
   remotely so StandBy resumes without reopening the app.
 ```
+APNs Live Activity update pushes use `apns-push-type: liveactivity` with
+**priority 10** for prompt delivery (priority 5 reserved if batching to conserve
+the frequent-updates budget; v1 uses on-change pushes so 10 is fine).
 
 ### Runtime loop (backend, per active user)
 ```
@@ -118,8 +154,9 @@ every ~10s (active users only):
   if changed(prev, cur):
       APNs push (apns-push-type: liveactivity) → activity push token
       payload (ContentState): { trackId, title, artist, album, artUrl,
-                                durationMs, progressMs, isPlaying, startedAt,
-                                dominantColor }
+                                durationMs, progressMs, isPlaying, startedAt }
+      (dominantColor is computed ON-DEVICE from the cached art — see Album art —
+       so the backend needs no server-side image pipeline.)
   prev = cur
 
 changed() = trackId differs | isPlaying differs | |progress - expected| > ~3s
@@ -146,18 +183,24 @@ interface MusicProvider {
 type NowPlaying = {
   trackId: string; title: string; artist: string; album: string
   artUrl?: string; durationMs: number; progressMs: number
-  isPlaying: boolean; startedAt: number; dominantColor?: string
+  isPlaying: boolean; startedAt: number
+  // dominantColor is NOT carried in the payload — derived on-device from art.
 }
 
 type ControlAction = "next" | "prev" | "playpause"
 ```
 
-- The poller iterates **server-poll** providers only (Spotify today).
-- **device-push** providers (Apple Music) report state via
-  `POST /nowplaying` from the app; same `NowPlaying` payload → same APNs push
-  path → same Live Activity UI.
-- Controls are routed per provider: Spotify via backend Web API calls; Apple
-  Music via `MPRemoteCommandCenter` / MusicKit on-device.
+**v1 scope:** only the **thin interface + Spotify server-poll impl** are built.
+The `device-push` kind is reserved in the type but the `/nowplaying` ingestion
+endpoint and on-device control routing are **deferred** until the Apple Music
+provider is actually implemented (YAGNI — Apple Music is a non-goal for v1). The
+interface shape keeps that future cheap without building dead machinery now.
+
+Future (when Apple Music is added):
+- **device-push** providers report state via `POST /nowplaying` from the app;
+  same `NowPlaying` payload → same APNs push path → same Live Activity UI.
+- Controls routed per provider: Spotify via backend Web API; Apple Music via
+  `MPRemoteCommandCenter` / MusicKit on-device.
 
 ## Backend (Node/TS on Fly.io)
 
@@ -178,19 +221,30 @@ backend/
     db.ts             # Postgres access (users, provider_tokens, devices)
     routes.ts         # HTTP endpoints
     config.ts         # loads secrets from env (Fly Secrets)
-    index.ts          # boot: HTTP server + poller
+    server.ts         # boot: HTTP server (API process)
+    poller-main.ts    # boot: poller loop (SEPARATE process — see below)
 ```
+
+### Process topology (single-poller guarantee)
+The **API server** and the **poller** run as **separate Fly processes**
+(`[processes]` in `fly.toml`), with the poller pinned to **exactly one
+instance**. This prevents duplicated Spotify polling under rolling deploys or
+horizontal scaling of the API — which would otherwise multiply per-app
+rate-limit usage. If the poller process is ever scaled >1, a Postgres advisory
+lock (leader election) gates the loop so only one instance polls.
 
 ### HTTP endpoints (app → backend, all authenticated via Apple identity)
 | Route | Purpose |
 |-------|---------|
-| `POST /auth/apple`        | exchange Apple identity token → session, userId |
-| `POST /spotify/connect`   | submit OAuth code → store encrypted refresh token |
-| `POST /activity/register` | submit activity push token (+ push-to-start token) |
+| `POST /auth/apple`        | verify Apple identity token → issue session JWT |
+| `POST /auth/refresh`      | exchange session refresh token → new access token |
+| `POST /spotify/connect`   | submit `{ code, code_verifier }` → store enc. token |
+| `POST /activity/register` | submit activity push token (+ push-to-start token); re-called on token rotation |
+| `POST /activity/heartbeat`| app pings while Activity alive → keeps user "active" |
 | `POST /activity/end`      | activity ended → poller pauses for this user |
-| `POST /nowplaying`        | device-push providers report state (Apple Music) |
 | `POST /control`           | `{ action }` → routed to provider |
 | `GET  /health`            | poller/status (debug) |
+| `POST /nowplaying`        | **deferred** — device-push providers (Apple Music) |
 
 ### Token vault (Fly.io recommendation)
 - **LibsodiumVault**: encrypts per-user tokens with `secretbox`; master
@@ -202,9 +256,17 @@ backend/
 ### Persistence (Postgres — managed, e.g. Supabase/Neon)
 ```
 users(id, apple_sub UNIQUE, created_at)
-provider_tokens(user_id, provider, ciphertext, nonce, updated_at)
-devices(user_id, push_token, activity_token, push_to_start_token, updated_at)
+provider_tokens(user_id, provider, ciphertext, nonce, updated_at,
+                needs_reauth BOOL)
+devices(id, user_id, activity_token, push_to_start_token,
+        last_heartbeat_at, active BOOL, updated_at)        -- N devices per user
 ```
+- `devices` is keyed by its own `id` (one row per device/install), so multiple
+  devices and reinstalls coexist instead of overwriting.
+- No plain APNs device token is stored — Live Activity updates target the
+  per-activity `activity_token`; `push_to_start_token` is the only other token
+  (for remote restart). A standard device token would only be added if normal
+  notifications are introduced.
 
 ### Resilience
 - Spotify `401` → refresh access token, retry.
@@ -215,10 +277,20 @@ devices(user_id, push_token, activity_token, push_to_start_token, updated_at)
 - Refresh token revoked → mark `needsReauth`, stop pushing, surface "Reconnect".
 
 ### Scaling / rate-limit strategy
-- Poll **active users only** (Activity alive or recently active).
-- Adaptive interval; pause idle users.
+- Poll **active users only**, gated by `devices.active` + `last_heartbeat_at`.
+- **Staleness fallback (force-quit/crash safety):** if no heartbeat within a TTL
+  (e.g. 90s) the user is marked inactive and dropped from the poll set even
+  though `/activity/end` never fired. Without this, a crashed app would be
+  polled until the ~8h Activity expiry, wasting rate budget.
+- **Fixed 10s interval for v1** (adaptive interval deferred — YAGNI until a
+  measured need).
 - Respect Spotify per-app rate limit; central backoff on `429`.
-- Spotify production quota extension required for >25 users (dev-mode limit).
+- **Spotify production quota is a real external risk, not a checkbox.** Dev mode
+  caps at 25 users; extended-quota approval for an independent app that
+  continuously polls player state is hard to obtain under current Spotify
+  developer policy, and some player endpoints have been deprecated. Treat App
+  Store distribution beyond 25 users as gated on Spotify approval, and keep poll
+  frequency no higher than necessary to stay within Developer Terms.
 
 ## Live Activity / Widget (StandBy)
 
@@ -250,11 +322,12 @@ Views:
 - Brand-logo usage rules apply for public release; fine for personal/sideload.
 
 ### Album art (local-image constraint)
-- Push includes `artUrl` + `dominantColor`.
-- App pre-downloads art to the **App Group container** while active; the Live
-  Activity reads it via `UIImage(contentsOfFile:)`.
-- Fallback when art not cached: `dominantColor` background / placeholder — never
-  blocks the rest of the UI.
+- Push includes `artUrl` only.
+- App pre-downloads art to the **App Group container** while active and
+  **computes `dominantColor` on-device** from the downloaded image (no backend
+  image pipeline); the Live Activity reads art via `UIImage(contentsOfFile:)`.
+- Fallback when art not cached: neutral/placeholder background — never blocks
+  the rest of the UI; `dominantColor` applied once art lands.
 
 ### Transport controls
 - Three interactive buttons via **App Intents** (iOS 17+); tappable in StandBy.
@@ -320,12 +393,25 @@ Views:
 - **Data deletion**: account + token deletion path (LGPD/GDPR).
 - **Spotify production approval** + quota extension for >25 users.
 - **Apple Music** (future): MusicKit entitlement + Apple Developer agreement.
-- Secrets only in **Fly Secrets**; rotation plan for `ENCRYPTION_KEY` /
-  `APNS_KEY`.
+- Secrets only in **Fly Secrets**; rotation plan for `ENCRYPTION_KEY`
+  (re-encrypt pass, see Open Items) and `APNS_KEY`.
+
+## Early Spikes (validate before full build)
+
+1. **Interactive `Button(intent:)` in StandBy on a physical device** — confirm a
+   tap activates the control vs. only waking the display. If it only wakes, the
+   control feature degrades to "tap to wake, then tap to act" or moves to the
+   Dynamic Island / Lock Screen only. Highest-risk assumption; prove first.
+2. **APNs Live Activity update round-trip** — push → visible update latency on
+   an AOD device; confirm frequent-updates budget holds with on-change pushes.
 
 ## Open Items / Future
 
 - Push-to-start (iOS 17.2+) for hands-free StandBy resume.
-- Apple Music device-push provider implementation.
+- Apple Music device-push provider (`/nowplaying` + on-device control routing).
 - Album art pre-fetch for upcoming queue tracks.
 - Migrate `TokenVault` to cloud KMS at scale.
+- **`ENCRYPTION_KEY` rotation procedure:** rotating the master key invalidates
+  all stored ciphertext, so rotation must re-encrypt — support a second
+  (`ENCRYPTION_KEY_PREV`) key for decrypt-old / encrypt-new, run a one-time
+  re-encrypt pass, then retire the old key. Document before first key rotation.
