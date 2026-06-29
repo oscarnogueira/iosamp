@@ -135,8 +135,12 @@ authenticated with the raw Apple token per request.
 
 ### Device registration (per StandBy session)
 ```
+App registerForRemoteNotifications → yields standard APNs device token
+  → app POSTs it to backend → stored in devices[deviceId].device_token
+  (REQUIRED: the silent content-available wake push for art can ONLY target the
+   standard device token, not the activity/push-to-start tokens.)
 App starts Live Activity → ActivityKit yields activity push token
-  → app POSTs token to backend → stored in devices[deviceId]
+  → app POSTs token to backend → stored in devices[deviceId].activity_token
 App OBSERVES activity.pushTokenUpdates stream → on rotation, re-POSTs new token
   (ActivityKit can rotate the per-activity token mid-session; pushing to a
    stale token silently fails).
@@ -242,8 +246,9 @@ lock (leader election) gates the loop so only one instance polls.
 | `POST /auth/apple`        | verify Apple identity token → issue session JWT |
 | `POST /auth/refresh`      | exchange session refresh token → new access token |
 | `POST /spotify/connect`   | submit `{ code, code_verifier }` → store enc. token |
+| `POST /device/register`   | submit standard APNs device token (for wake push) |
 | `POST /activity/register` | submit activity push token (+ push-to-start token); re-called on token rotation |
-| `POST /activity/heartbeat`| app pings while Activity alive → keeps user "active" |
+| `POST /activity/heartbeat`| app pings on lifecycle transitions only (coarse backstop, hours TTL) |
 | `POST /activity/end`      | activity ended → poller pauses for this user |
 | `POST /control`           | `{ action }` → routed to provider |
 | `GET  /health`            | poller/status (debug) |
@@ -261,15 +266,16 @@ lock (leader election) gates the loop so only one instance polls.
 users(id, apple_sub UNIQUE, created_at)
 provider_tokens(user_id, provider, ciphertext, nonce, updated_at,
                 needs_reauth BOOL)
-devices(id, user_id, activity_token, push_to_start_token,
-        last_heartbeat_at, active BOOL, updated_at)        -- N devices per user
+devices(id, user_id, device_token, activity_token, push_to_start_token,
+        last_heartbeat_at, last_push_ok_at, active BOOL, updated_at)
+                                                          -- N devices per user
 ```
 - `devices` is keyed by its own `id` (one row per device/install), so multiple
   devices and reinstalls coexist instead of overwriting.
-- No plain APNs device token is stored — Live Activity updates target the
-  per-activity `activity_token`; `push_to_start_token` is the only other token
-  (for remote restart). A standard device token would only be added if normal
-  notifications are introduced.
+- Three token columns, each for a distinct APNs path:
+  - `device_token` (standard) → **silent `content-available` wake push** (art).
+  - `activity_token` (per-activity) → **`liveactivity` update push** (text/state).
+  - `push_to_start_token` → remote restart of an Activity (iOS 17.2+).
 
 ### Resilience
 - Spotify `401` → refresh access token, retry.
@@ -293,6 +299,11 @@ is therefore derived from signals that do not require the app to run:
   only on **foreground/background lifecycle transitions** (not on a timer), with
   a TTL measured in **hours**. This only catches stale state between sessions;
   it is NOT the primary liveness signal and never gates the ~10s loop.
+- **Zombie eviction:** because update pushes are on-change only, a force-quit
+  *while paused* yields no change → no push → no 410, leaving a stale row in the
+  poll set. Guard with a **max-age-without-successful-push** eviction
+  (`last_push_ok_at`): if a device has been polled but received no successful
+  push for N minutes, drop it. Degrades to bounded wasted polls, not breakage.
 
 ### Scaling / rate-limit strategy
 - Poll **active users only**, gated by the liveness model above
@@ -349,11 +360,14 @@ cannot download art for tracks that change mid-session. Resolution:
   was unimplementable while suspended.)
 - **Album art image → best-effort via a silent wake push.** On track change the
   backend sends, alongside the `liveactivity` update, a **silent
-  `content-available` background push**. iOS wakes the app briefly in the
-  background to download the new art into the App Group container; the Live
-  Activity then reads it via `UIImage(contentsOfFile:)`. iOS throttles
-  background pushes, so this is **best-effort** — for a typical ~3-min track it
-  comfortably fits the budget, but rapid skipping may miss some.
+  `content-available` background push to the standard `device_token`** (this is
+  the only token that accepts background pushes). iOS wakes the app briefly in
+  the background; the app downloads the new art into the App Group container,
+  then calls **`activity.update(...)`** to force the Live Activity to re-render
+  with the now-cached image (a file appearing in the container does not by
+  itself trigger a re-render). iOS throttles background pushes, so this is
+  **best-effort** — for a typical ~3-min track it comfortably fits the budget,
+  but rapid skipping may miss some.
 - **Guaranteed fallback:** whenever the art file is not yet cached, the Live
   Activity renders the **backend `dominantColor` background** + text + badge.
   Art never blocks rendering; it fills in when the wake push lands.
