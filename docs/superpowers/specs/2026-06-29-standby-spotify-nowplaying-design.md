@@ -154,9 +154,11 @@ every ~10s (active users only):
   if changed(prev, cur):
       APNs push (apns-push-type: liveactivity) → activity push token
       payload (ContentState): { trackId, title, artist, album, artUrl,
-                                durationMs, progressMs, isPlaying, startedAt }
-      (dominantColor is computed ON-DEVICE from the cached art — see Album art —
-       so the backend needs no server-side image pipeline.)
+                                durationMs, progressMs, isPlaying, startedAt,
+                                dominantColor }
+      on track change also send a silent content-available push to wake the app
+      to cache art (see Album art).
+      backend computes dominantColor from the fetched art (small image pipeline).
   prev = cur
 
 changed() = trackId differs | isPlaying differs | |progress - expected| > ~3s
@@ -184,7 +186,7 @@ type NowPlaying = {
   trackId: string; title: string; artist: string; album: string
   artUrl?: string; durationMs: number; progressMs: number
   isPlaying: boolean; startedAt: number
-  // dominantColor is NOT carried in the payload — derived on-device from art.
+  dominantColor?: string  // hex, computed on the BACKEND from fetched art
 }
 
 type ControlAction = "next" | "prev" | "playpause"
@@ -216,7 +218,8 @@ backend/
     vault/
       vault.ts        # TokenVault interface
       libsodium.ts    # LibsodiumVault (key from ENCRYPTION_KEY env)
-    apns.ts           # JWT (.p8) signing, liveactivity push, push-to-start
+    apns.ts           # JWT (.p8) signing, liveactivity + silent content-available push, push-to-start
+    artwork.ts        # fetch art, extract dominantColor (small image pipeline)
     poller.ts         # 10s loop over active users/server-poll providers
     db.ts             # Postgres access (users, provider_tokens, devices)
     routes.ts         # HTTP endpoints
@@ -233,7 +236,7 @@ horizontal scaling of the API — which would otherwise multiply per-app
 rate-limit usage. If the poller process is ever scaled >1, a Postgres advisory
 lock (leader election) gates the loop so only one instance polls.
 
-### HTTP endpoints (app → backend, all authenticated via Apple identity)
+### HTTP endpoints (app → backend, all authenticated via the backend session JWT)
 | Route | Purpose |
 |-------|---------|
 | `POST /auth/apple`        | verify Apple identity token → issue session JWT |
@@ -276,12 +279,24 @@ devices(id, user_id, activity_token, push_to_start_token,
 - APNs `410` → clear dead activity token, await re-registration.
 - Refresh token revoked → mark `needsReauth`, stop pushing, surface "Reconnect".
 
+### Active-user / liveness model (reconciled with Constraint #1)
+A StandBy app is **suspended**, so it CANNOT emit a periodic heartbeat. Liveness
+is therefore derived from signals that do not require the app to run:
+- **Primary — APNs feedback:** when the poller pushes a Live Activity update and
+  APNs returns **410** (token no longer valid), the Activity is gone (ended,
+  expired, or app force-quit, which dismisses its Live Activities) → mark the
+  device inactive and drop it from the poll set. This is the real
+  force-quit/crash detector; no app heartbeat needed.
+- **Secondary — Spotify state:** `204` (nothing playing) pauses polling for that
+  user until activity resumes (cheap re-check at a slow cadence).
+- **Coarse backstop — lifecycle heartbeat:** the app pings `/activity/heartbeat`
+  only on **foreground/background lifecycle transitions** (not on a timer), with
+  a TTL measured in **hours**. This only catches stale state between sessions;
+  it is NOT the primary liveness signal and never gates the ~10s loop.
+
 ### Scaling / rate-limit strategy
-- Poll **active users only**, gated by `devices.active` + `last_heartbeat_at`.
-- **Staleness fallback (force-quit/crash safety):** if no heartbeat within a TTL
-  (e.g. 90s) the user is marked inactive and dropped from the poll set even
-  though `/activity/end` never fired. Without this, a crashed app would be
-  polled until the ~8h Activity expiry, wasting rate budget.
+- Poll **active users only**, gated by the liveness model above
+  (`devices.active`, cleared on APNs 410).
 - **Fixed 10s interval for v1** (adaptive interval deferred — YAGNI until a
   measured need).
 - Respect Spotify per-app rate limit; central backoff on `429`.
@@ -321,16 +336,34 @@ Views:
   (`provider.id → image`); no download. Simple monochrome glyphs, brand tint.
 - Brand-logo usage rules apply for public release; fine for personal/sideload.
 
-### Album art (local-image constraint)
-- Push includes `artUrl` only.
-- App pre-downloads art to the **App Group container** while active and
-  **computes `dominantColor` on-device** from the downloaded image (no backend
-  image pipeline); the Live Activity reads art via `UIImage(contentsOfFile:)`.
-- Fallback when art not cached: neutral/placeholder background — never blocks
-  the rest of the UI; `dominantColor` applied once art lands.
+### Album art (local-image constraint + app suspension)
+Two facts collide: the widget extension cannot fetch remote images (Constraint
+#5), and the app is suspended during a StandBy session (Constraint #1) so it
+cannot download art for tracks that change mid-session. Resolution:
+
+- **`dominantColor` → computed on the BACKEND.** The backend fetches the art
+  once per track, extracts the dominant color, and includes the **hex string**
+  in the Live Activity push payload (tiny, fits APNs 4KB). This works regardless
+  of app state and always gives a correct accent/background color immediately on
+  track change. (This intentionally reverses the earlier on-device plan, which
+  was unimplementable while suspended.)
+- **Album art image → best-effort via a silent wake push.** On track change the
+  backend sends, alongside the `liveactivity` update, a **silent
+  `content-available` background push**. iOS wakes the app briefly in the
+  background to download the new art into the App Group container; the Live
+  Activity then reads it via `UIImage(contentsOfFile:)`. iOS throttles
+  background pushes, so this is **best-effort** — for a typical ~3-min track it
+  comfortably fits the budget, but rapid skipping may miss some.
+- **Guaranteed fallback:** whenever the art file is not yet cached, the Live
+  Activity renders the **backend `dominantColor` background** + text + badge.
+  Art never blocks rendering; it fills in when the wake push lands.
+- The art for the track playing **when StandBy starts** is downloaded while the
+  app is still foreground, so session start always has art.
 
 ### Transport controls
-- Three interactive buttons via **App Intents** (iOS 17+); tappable in StandBy.
+- Three interactive buttons via **App Intents** (iOS 17+). Tappability in
+  StandBy is **unverified** (see Constraint #8 / Spike #1) — confirmed on Lock
+  Screen; must be proven in StandBy before this path is relied upon.
 - Flow: tap → AppIntent (app process, background) → `POST /control {action}` →
   backend → Spotify Web API (`pause`/`play`/`next`/`previous`) → poller (≤10s)
   pushes new state. App Intent may also trigger an immediate backend push.
@@ -367,7 +400,9 @@ Views:
   control calls.
 - `poller.ts`: `changed()` cases (same track, track change, play↔pause,
   seek > 3s, normal progress does not fire); active-user gating.
-- `apns.ts`: JWT signing, correct payload, 410 handling.
+- `apns.ts`: JWT signing, correct payload, 410 handling → marks device inactive.
+- `artwork.ts`: fetch + dominantColor extraction (known image → expected hex);
+  fetch failure → omit color gracefully.
 - `vault/libsodium.ts`: seal/open round-trip, wrong-key failure.
 - `auth/apple.ts`: identity-token verification (valid/invalid/expired).
 - `routes.ts`: auth required, valid/invalid payloads.
@@ -404,6 +439,10 @@ Views:
    Dynamic Island / Lock Screen only. Highest-risk assumption; prove first.
 2. **APNs Live Activity update round-trip** — push → visible update latency on
    an AOD device; confirm frequent-updates budget holds with on-change pushes.
+3. **Silent `content-available` wake reliability** — how often iOS actually
+   wakes the suspended app to download art mid-session, and whether it keeps up
+   with normal track changes. Determines whether per-track art is "reliable" or
+   "best-effort with color fallback" (see Album art).
 
 ## Open Items / Future
 
