@@ -51,4 +51,7 @@ const deps = {
 
 const app = Fastify({ logger: true });
 registerRoutes(app, deps);
-app.listen({ port: Number(process.env.PORT ?? 8080), host: "0.0.0.0" });
+app.listen({ port: Number(process.env.PORT ?? 8080), host: "0.0.0.0" }).catch((e) => {
+  app.log.error(e);
+  process.exit(1);
+});

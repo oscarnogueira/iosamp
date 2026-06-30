@@ -57,4 +57,7 @@ async function tick() {
     process.exit(0);
   }
   setInterval(tick, 10_000);
-})();
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
