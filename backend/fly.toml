@@ -1,7 +1,5 @@
 app = "standby-nowplaying"
 
-[build]
-
 [deploy]
   release_command = "npm run migrate"
 
