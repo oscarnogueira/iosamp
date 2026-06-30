@@ -22,7 +22,10 @@ export async function exchangeCode(
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: body.toString(),
   });
-  if (res.statusCode !== 200) throw new Error(`spotify token exchange ${res.statusCode}`);
+  if (res.statusCode !== 200) {
+    await res.body.dump();
+    throw new Error(`spotify token exchange ${res.statusCode}`);
+  }
   return (await res.body.json()) as {
     access_token: string;
     refresh_token: string;
@@ -42,11 +45,15 @@ export async function refreshAccessToken(clientId: string, refreshToken: string)
     body: body.toString(),
   });
   if (res.statusCode === 400) {
+    await res.body.dump();
     const e: any = new Error("refresh revoked");
     e.revoked = true;
     throw e;
   }
-  if (res.statusCode !== 200) throw new Error(`spotify refresh ${res.statusCode}`);
+  if (res.statusCode !== 200) {
+    await res.body.dump();
+    throw new Error(`spotify refresh ${res.statusCode}`);
+  }
   return (await res.body.json()) as {
     access_token: string;
     expires_in: number;
@@ -64,16 +71,22 @@ export const spotify: MusicProvider = {
     });
     if (res.statusCode === 204) return null;
     if (res.statusCode === 401) {
+      await res.body.dump();
       const e: any = new Error("expired");
       e.expired = true;
       throw e;
     }
     if (res.statusCode === 429) {
+      const retryAfter = Number(res.headers["retry-after"] ?? "1");
+      await res.body.dump();
       const e: any = new Error("rate-limited");
-      e.retryAfter = Number(res.headers["retry-after"] ?? "1");
+      e.retryAfter = retryAfter;
       throw e;
     }
-    if (res.statusCode !== 200) throw new Error(`spotify currently-playing ${res.statusCode}`);
+    if (res.statusCode !== 200) {
+      await res.body.dump();
+      throw new Error(`spotify currently-playing ${res.statusCode}`);
+    }
     const b: any = await res.body.json();
     if (!b.item) return null;
     return {
@@ -95,17 +108,24 @@ export const spotify: MusicProvider = {
       request(`${API}${path}`, { method, headers: auth });
 
     if (action === "next") {
-      await call("POST", "/v1/me/player/next");
+      const r = await call("POST", "/v1/me/player/next");
+      await r.body.dump();
       return;
     }
     if (action === "prev") {
-      await call("POST", "/v1/me/player/previous");
+      const r = await call("POST", "/v1/me/player/previous");
+      await r.body.dump();
       return;
     }
     // playpause: fetch current state then toggle
     const res = await request(`${API}/v1/me/player`, { headers: auth });
-    const playing =
-      res.statusCode === 200 ? ((await res.body.json()) as any).is_playing : false;
-    await call("PUT", playing ? "/v1/me/player/pause" : "/v1/me/player/play");
+    let playing = false;
+    if (res.statusCode === 200) {
+      playing = ((await res.body.json()) as any).is_playing;
+    } else {
+      await res.body.dump();
+    }
+    const r = await call("PUT", playing ? "/v1/me/player/pause" : "/v1/me/player/play");
+    await r.body.dump();
   },
 };
