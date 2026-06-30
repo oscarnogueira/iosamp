@@ -90,6 +90,7 @@ export function makeDb(pool: Pool) {
          WHERE d.active = true AND pt.needs_reauth = false
            AND (
              d.last_push_ok_at > now() - interval '15 minutes'
+             OR d.last_heartbeat_at > now() - interval '15 minutes'
              OR (d.last_push_ok_at IS NULL
                  AND COALESCE(d.last_heartbeat_at, d.updated_at) > now() - interval '15 minutes')
            )`,

@@ -19,8 +19,13 @@ export function registerRoutes(app: FastifyInstance, deps: any) {
     return (await deps.refreshAccessToken(deps.clientId, refresh)).access_token;
   }
 
-  app.post("/auth/apple", async (req: any) => {
-    const { sub } = await deps.apple.verify(req.body.idToken);
+  app.post("/auth/apple", async (req: any, reply: any) => {
+    let sub: string;
+    try {
+      ({ sub } = await deps.apple.verify(req.body.idToken));
+    } catch {
+      return reply.code(401).send({ error: "invalid apple token" });
+    }
     const user = await deps.db.upsertUser(sub);
     return {
       sessionToken: deps.session.issue(user.id),
@@ -38,8 +43,13 @@ export function registerRoutes(app: FastifyInstance, deps: any) {
     }
   });
 
-  app.post("/spotify/connect", { preHandler: auth }, async (req: any) => {
-    const tok = await deps.spotify.exchangeCode(req.body.code, req.body.codeVerifier);
+  app.post("/spotify/connect", { preHandler: auth }, async (req: any, reply: any) => {
+    let tok: any;
+    try {
+      tok = await deps.spotify.exchangeCode(req.body.code, req.body.codeVerifier);
+    } catch {
+      return reply.code(400).send({ error: "spotify exchange failed" });
+    }
     await deps.db.saveProviderToken(req.userId, "spotify", await deps.vault.seal(tok.refresh_token));
     return { ok: true };
   });
@@ -67,14 +77,28 @@ export function registerRoutes(app: FastifyInstance, deps: any) {
     return { ok: true };
   });
 
-  app.post("/control", { preHandler: auth }, async (req: any) => {
-    await deps.spotify.control(await userAccessToken(req.userId), req.body.action);
+  app.post("/control", { preHandler: auth }, async (req: any, reply: any) => {
+    let access: string;
+    try {
+      access = await userAccessToken(req.userId);
+    } catch (e: any) {
+      if (e?.message === "needs-reauth") return reply.code(409).send({ error: "needs-reauth" });
+      throw e;
+    }
+    await deps.spotify.control(access, req.body.action);
     return { ok: true };
   });
 
-  app.get("/nowplaying/current", { preHandler: auth }, async (req: any) =>
-    (await deps.spotify.getNowPlaying(await userAccessToken(req.userId))) ?? null,
-  );
+  app.get("/nowplaying/current", { preHandler: auth }, async (req: any, reply: any) => {
+    let access: string;
+    try {
+      access = await userAccessToken(req.userId);
+    } catch (e: any) {
+      if (e?.message === "needs-reauth") return reply.code(409).send({ error: "needs-reauth" });
+      throw e;
+    }
+    return (await deps.spotify.getNowPlaying(access)) ?? null;
+  });
 
   app.get("/health", async () => ({ ok: true }));
 }

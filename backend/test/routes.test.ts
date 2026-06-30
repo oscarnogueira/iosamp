@@ -57,6 +57,52 @@ test("POST /auth/apple returns session token", async () => {
   expect(res.json().sessionToken).toBeDefined();
 });
 
+test("POST /auth/apple returns 401 when apple verify fails", async () => {
+  const deps = makeDeps();
+  deps.apple.verify = vi.fn(async () => { throw new Error("bad token"); });
+  const { app } = buildTestApp(deps);
+  const res = await app.inject({ method: "POST", url: "/auth/apple", payload: { idToken: "x" } });
+  expect(res.statusCode).toBe(401);
+  expect(res.json()).toEqual({ error: "invalid apple token" });
+});
+
+test("POST /spotify/connect returns 400 when exchangeCode fails", async () => {
+  const deps = makeDeps();
+  deps.spotify.exchangeCode = vi.fn(async () => { throw new Error("boom"); });
+  const { app } = buildTestApp(deps);
+  const res = await app.inject({
+    method: "POST",
+    url: "/spotify/connect",
+    headers: bearer(),
+    payload: { code: "c", codeVerifier: "v" },
+  });
+  expect(res.statusCode).toBe(400);
+  expect(res.json()).toEqual({ error: "spotify exchange failed" });
+});
+
+test("POST /control returns 409 when provider token needs reauth", async () => {
+  const deps = makeDeps();
+  deps.db.getProviderToken = vi.fn(async () => ({ ciphertext: "ct", nonce: "nc", needs_reauth: true }));
+  const { app } = buildTestApp(deps);
+  const res = await app.inject({
+    method: "POST",
+    url: "/control",
+    headers: bearer(),
+    payload: { action: "next" },
+  });
+  expect(res.statusCode).toBe(409);
+  expect(res.json()).toEqual({ error: "needs-reauth" });
+});
+
+test("GET /nowplaying/current returns 409 when provider token needs reauth", async () => {
+  const deps = makeDeps();
+  deps.db.getProviderToken = vi.fn(async () => ({ ciphertext: "ct", nonce: "nc", needs_reauth: true }));
+  const { app } = buildTestApp(deps);
+  const res = await app.inject({ method: "GET", url: "/nowplaying/current", headers: bearer() });
+  expect(res.statusCode).toBe(409);
+  expect(res.json()).toEqual({ error: "needs-reauth" });
+});
+
 test("authed routes reject missing session", async () => {
   const { app } = buildTestApp();
   const res = await app.inject({ method: "POST", url: "/control", payload: { action: "next" } });

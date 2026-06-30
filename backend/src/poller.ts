@@ -18,19 +18,30 @@ function toContentState(np: NowPlaying) {
 
 // All collaborators injected via deps — no concrete imports.
 // deps.refreshAccessToken(clientId, refreshToken) → { access_token }.
+// Access tokens last ~1h; cache them per device so we only call refreshAccessToken
+// at most ~once per skew window instead of every 10s tick.
+const ACCESS_TOKEN_SKEW_MS = 50 * 60 * 1000;
+
 export async function pollOneUser(deps: {
   device: any; vault: any; db: any; spotify: any; apns: any; artwork: any;
   refreshAccessToken: (clientId: string, refresh: string) => Promise<{ access_token: string }>;
   clientId: string; prev: NowPlaying | null; now: number;
+  accessTokenCache?: Map<string, { accessToken: string; expiresAt: number }>;
 }): Promise<NowPlaying | null> {
-  const { device, vault, db, spotify, apns, artwork, refreshAccessToken, clientId, prev, now } = deps;
-  const refresh = await vault.open(device.ciphertext, device.nonce);
+  const { device, vault, db, spotify, apns, artwork, refreshAccessToken, clientId, prev, now, accessTokenCache } = deps;
   let access: string;
-  try {
-    access = (await refreshAccessToken(clientId, refresh)).access_token;
-  } catch (e: any) {
-    if (e.revoked) { await db.markNeedsReauth(device.user_id, "spotify"); return prev; }
-    return prev;                            // transient refresh error: keep last
+  const cached = accessTokenCache?.get(device.id);
+  if (cached && cached.expiresAt > now) {
+    access = cached.accessToken;
+  } else {
+    const refresh = await vault.open(device.ciphertext, device.nonce);
+    try {
+      access = (await refreshAccessToken(clientId, refresh)).access_token;
+    } catch (e: any) {
+      if (e.revoked) { await db.markNeedsReauth(device.user_id, "spotify"); return prev; }
+      return prev;                          // transient refresh error: keep last
+    }
+    accessTokenCache?.set(device.id, { accessToken: access, expiresAt: now + ACCESS_TOKEN_SKEW_MS });
   }
   let cur: NowPlaying | null;
   try { cur = await spotify.getNowPlaying(access); }
@@ -44,11 +55,15 @@ export async function pollOneUser(deps: {
     if (cur) {
       cur.dominantColor = cur.artUrl ? await artwork.dominantColor(cur.artUrl) : undefined;
       status = await apns.pushUpdate(device.activity_token, toContentState(cur));
-      if (device.device_token) await apns.pushSilentWake(device.device_token);
+      await db.markPushResult(device.id, status);
+      if (device.device_token) {
+        const silentStatus = await apns.pushSilentWake(device.device_token);
+        await db.markPushResult(device.id, silentStatus);   // a 410 here deactivates too
+      }
     } else {
       status = await apns.pushStopped(device.activity_token);
+      await db.markPushResult(device.id, status);
     }
-    await db.markPushResult(device.id, status);
   }
   return cur;
 }

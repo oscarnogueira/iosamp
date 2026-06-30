@@ -9,7 +9,8 @@ export function issueRefresh(userId: string, secret: string): string {
 }
 
 export function verifySession(token: string, secret: string): { userId: string } {
-  const p = jwt.verify(token, secret) as { sub: string };
+  const p = jwt.verify(token, secret) as { sub: string; typ?: string };
+  if (p.typ === "refresh") throw new Error("refresh token not valid as session");
   return { userId: p.sub };
 }
 

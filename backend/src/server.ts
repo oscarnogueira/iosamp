@@ -50,6 +50,9 @@ const deps = {
 };
 
 const app = Fastify({ logger: true });
+// An idle-client connection drop emits an 'error' on the Pool; without a listener
+// Node would crash the process. Log and continue.
+pool.on("error", (e) => app.log.error(e, "pg pool error"));
 registerRoutes(app, deps);
 app.listen({ port: Number(process.env.PORT ?? 8080), host: "0.0.0.0" }).catch((e) => {
   app.log.error(e);

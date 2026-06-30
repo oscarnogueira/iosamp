@@ -32,6 +32,11 @@ test("session token rejected by verifyRefresh (typ !== refresh)", () => {
   expect(() => verifyRefresh(t, "secret")).toThrow();
 });
 
+test("refresh token rejected by verifySession (typ === refresh)", () => {
+  const t = issueRefresh("user-1", "secret");
+  expect(() => verifySession(t, "secret")).toThrow();
+});
+
 // ── apple tests (jose is mocked — no network) ─────────────────
 
 test("verifyAppleIdentityToken resolves to { sub }", async () => {

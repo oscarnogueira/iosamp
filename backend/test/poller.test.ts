@@ -165,6 +165,65 @@ test("d. getNowPlaying null (204) with prev track → pushStopped + markPushResu
   expect(out).toBe(null);
 });
 
+test("b2. silent-wake result is fed through markPushResult (410 deactivates)", async () => {
+  const prev = {
+    trackId: "t0", title: "Old", artist: "A", album: "B",
+    artUrl: "http://art/old.jpg", durationMs: 100000, progressMs: 5000,
+    isPlaying: true, startedAt: 0, dominantColor: undefined,
+  };
+  const deps = mkDeps({
+    prev,
+    now: 6000,
+    apns: {
+      pushUpdate: vi.fn(async () => 200),
+      pushSilentWake: vi.fn(async () => 410),
+      pushStopped: vi.fn(async () => 200),
+    },
+  });
+  await pollOneUser(deps as any);
+  expect(deps.apns.pushSilentWake).toHaveBeenCalledWith("dev-tok");
+  expect(deps.db.markPushResult).toHaveBeenCalledWith("dev1", 200); // main update
+  expect(deps.db.markPushResult).toHaveBeenCalledWith("dev1", 410); // silent wake
+});
+
+test("f. access token is cached across ticks within the skew window", async () => {
+  const cache = new Map<string, { accessToken: string; expiresAt: number }>();
+  const refreshAccessToken = vi.fn(async () => ({ access_token: "a" }));
+  const np = {
+    trackId: "t1", title: "Song", artist: "Artist", album: "Album",
+    artUrl: undefined, durationMs: 200000, progressMs: 1000,
+    isPlaying: true, startedAt: 0, dominantColor: undefined,
+  };
+  const mk = (now: number) =>
+    mkDeps({
+      accessTokenCache: cache,
+      refreshAccessToken,
+      now,
+      prev: null,
+      spotify: { getNowPlaying: vi.fn(async () => np) },
+    });
+
+  await pollOneUser(mk(1000) as any);
+  await pollOneUser(mk(2000) as any); // well within 50min skew
+  expect(refreshAccessToken).toHaveBeenCalledTimes(1);
+});
+
+test("g. revoked refresh still triggers markNeedsReauth even with a cache", async () => {
+  const cache = new Map<string, { accessToken: string; expiresAt: number }>();
+  const deps = mkDeps({
+    accessTokenCache: cache,
+    prev: { ...base, artUrl: undefined, dominantColor: undefined } as any,
+    refreshAccessToken: vi.fn(async () => {
+      const e: any = new Error("revoked");
+      e.revoked = true;
+      throw e;
+    }),
+  });
+  await pollOneUser(deps as any);
+  expect(deps.db.markNeedsReauth).toHaveBeenCalledWith("u1", "spotify");
+  expect(cache.has("dev1")).toBe(false); // nothing cached on failure
+});
+
 test("e. no activity_token → no push even on change", async () => {
   const prev = {
     trackId: "t0",
