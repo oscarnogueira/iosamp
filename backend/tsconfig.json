@@ -38,5 +38,6 @@
     "skipLibCheck": true,
 
     "moduleResolution": "nodenext",
-  }
+  },
+  "include": ["src"]
 }

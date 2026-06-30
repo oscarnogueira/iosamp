@@ -6,7 +6,7 @@ export async function dominantColorFromBytes(bytes: Buffer | Uint8Array): Promis
     .resize(1, 1, { fit: "fill" })
     .raw()
     .toBuffer({ resolveWithObject: true });
-  const [r, g, b] = data;
+  const [r = 0, g = 0, b = 0] = data;
   return "#" + [r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("");
 }
 
