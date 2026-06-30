@@ -46,6 +46,57 @@ export function makeDb(pool: Pool) {
       );
     },
 
+    async registerDevice(userId: string, t: { deviceToken?: string }) {
+      const { rows } = await pool.query(
+        `INSERT INTO devices (user_id, device_token, active) VALUES ($1,$2,false) RETURNING *`,
+        [userId, t.deviceToken ?? null],
+      );
+      return rows[0];
+    },
+
+    async setActivityToken(deviceId: string, activityToken: string, pushToStart: string | null) {
+      await pool.query(
+        `UPDATE devices SET activity_token=$2, push_to_start_token=$3, active=true,
+           last_heartbeat_at=now(), updated_at=now() WHERE id=$1`,
+        [deviceId, activityToken, pushToStart],
+      );
+    },
+
+    async endActivity(deviceId: string) {
+      await pool.query(`UPDATE devices SET active=false, updated_at=now() WHERE id=$1`, [deviceId]);
+    },
+
+    async heartbeat(deviceId: string) {
+      await pool.query(`UPDATE devices SET last_heartbeat_at=now() WHERE id=$1`, [deviceId]);
+    },
+
+    async markPushResult(deviceId: string, status: number) {
+      if (status === 410) {
+        await pool.query(`UPDATE devices SET active=false WHERE id=$1`, [deviceId]);
+        return;
+      }
+      if (status >= 200 && status < 300) {
+        await pool.query(`UPDATE devices SET last_push_ok_at=now() WHERE id=$1`, [deviceId]);
+      }
+    },
+
+    async activeDevices() {
+      const { rows } = await pool.query(
+        `SELECT d.id, d.user_id, d.device_token, d.activity_token, d.push_to_start_token,
+                d.last_heartbeat_at, d.last_push_ok_at, d.active, d.updated_at,
+                pt.ciphertext, pt.nonce, pt.needs_reauth
+         FROM devices d
+         JOIN provider_tokens pt ON pt.user_id = d.user_id AND pt.provider='spotify'
+         WHERE d.active = true AND pt.needs_reauth = false
+           AND (
+             d.last_push_ok_at > now() - interval '15 minutes'
+             OR (d.last_push_ok_at IS NULL
+                 AND COALESCE(d.last_heartbeat_at, d.updated_at) > now() - interval '15 minutes')
+           )`,
+      );
+      return rows;
+    },
+
     raw: pool,
   };
 }
